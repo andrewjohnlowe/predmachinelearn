@@ -174,8 +174,8 @@ ncores <- getDoParWorkers()
 On this machine, we have `r ncores` available cores.
 
 ```{r train_ctrl}
-k <- 10
-reps <- 3
+k <- 5
+reps <- 2
 ctrl <- trainControl(method="cv", number=k, repeats=reps)
 # print(ctrl)
 ```
@@ -191,7 +191,7 @@ xdata = subset(training, select = -classe)
 ### Model
 
 ```{r train, cache=TRUE}
-model <- train(y = ydata, x = xdata, method="LogitBoost", trControl=ctrl, do.trace=TRUE)
+model <- train(y = ydata, x = xdata, method="rf", trControl=ctrl, do.trace=TRUE)
 
 print(model)
 plot(model)
