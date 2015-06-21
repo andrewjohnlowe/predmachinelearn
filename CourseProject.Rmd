@@ -1,0 +1,284 @@
+---
+title: "Practical Machine Learning: Course Project"
+author: "Andrew John Lowe"
+date: "21 June 2015"
+output:
+    html_document:
+        toc: true
+---
+
+## Setup
+
+First, let's setup some global options for knitting this project:
+```{r setup}
+# Set globals:
+require(knitr)
+options(width = 70)
+# opts_chunk$set(
+#   echo = TRUE,
+#   message = FALSE,
+#   warning = FALSE,
+#   error = FALSE,
+#   comment = NA, 
+#   cache = TRUE, 
+#   dev = 'pdf'
+#   )
+```
+
+I like to start with a completely fresh environment. Let's remove anything from the last R session:
+```{r start_fresh}
+# Delete leftovers from last session:
+rm(list = ls())
+```
+
+Set a random seed to assure reproducibility of the results:
+```{r set_rand_seed}
+# Set random seed:
+set.seed(42)
+# This will guarantee reproducability of the results
+```
+
+## Tools
+
+Install a bunch of libraries that we'll need later:
+```{r libraries}
+if(!require(caret)) {
+  install.packages("caret")
+  }
+library(caret)
+
+if(!require(rpart)) {
+  install.packages("rpart")
+  }
+library(rpart)
+
+if(!require(randomForest)) {
+  install.packages("randomForest")
+  }
+library(randomForest)
+
+if(!require(caTools)) {
+  install.packages("caTools")
+  }
+library(caTools)
+
+if(!require(e1071)) {
+  install.packages("e1071")
+}
+library(e1071)
+
+if(!require(kernlab)) {
+  install.packages("kernlab")
+}
+library(kernlab)
+
+if(!require(doParallel)) {
+  install.packages("doParallel")
+}
+library(doParallel)
+
+if(!require(pROC)) {
+  install.packages("pROC")
+}
+library(pROC)
+```
+
+## Data preparation
+
+Check if we already downloaded the data from the web. If the files don't exist in the session working directory, download them:
+```{r download.files}
+# Download training data:
+  training.file <- "pml-training.csv"
+if(!file.exists(training.file)) { 
+  URL1 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+  download.file(URL1, training.file, method="curl")
+}
+
+# Download testing data:
+testing.file <- "pml-testing.csv"
+if(!file.exists(testing.file)) { 
+  URL2 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+  download.file(URL2, testing.file, method="curl")
+}
+```
+
+From inspecting the files previously, we know that the first column contains the row names. We'll tell read.csv that. Also, we noticed that there are a bunch of "#DIV/0!" entries the denote a division by zero error; we'll treat those values as NA's: 
+```{r read.csv}
+# We're going to replace the #DIV/0! entries with NA
+training <- read.csv(training.file, row.names=1, na.strings=c("NA", "#DIV/0!"))
+testing <- read.csv(testing.file, row.names=1, na.strings=c("NA", "#DIV/0!"))
+```
+
+### Data cleaning
+
+The data is segmented into a number of blocks of data called "windows". The "new_window" variable indicates the start of a new window. These windows are indexed by the "num_window" variable. Using the data in each window, a number of statistics appear to have been calculated: mean, min, max, standard deviation, skewness, kurtosis, and so on. Their values are contained in separate columns in the rows for which the "new_window" variable (indicating the start of a new data block) is equal to "yes". The remaining rows in these columns are NA's. We'll drop these columns, thereby removing all the NA's:  
+```{r remove_na_columns}
+na.data <- sapply(training, function(x) sum(is.na(x)) > 0)
+names(na.data) <- colnames(training)
+print("Dropping these columns:")
+print(names(training[na.data]))
+training <- training[!na.data]
+```
+
+The first six columns contain data that are unlikely to have any predictive value; they include the name of the test subject, time-stamps, and so on. We remove these columns:
+```{r subset}
+training <- training[,7:ncol(training)]
+print(names(training))
+# # For testing only (use less data for quick tests):
+# inTrain <- createDataPartition(y=training$classe,p=0.1,list=FALSE)
+# training <- training[inTrain,]
+```
+
+Features with near zero variance are unlikely to be useful. Let's check if any exist, and then remove them:
+```{r near_zero_var}
+nzv <- nearZeroVar(training, saveMetrics=TRUE)
+# We remove these:
+nzv.to.remove <- names(training[, nzv$nzv])
+training <- training[, !nzv$nzv]
+```
+
+This proceedure removes `r length(nzv.to.remove)` columns from the data. We are left with tidy data that we can use to build a model.
+
+Next, we partition the data into a training set and a cross-validation set:
+```{r partition}
+inTrain <- createDataPartition(y=training$classe,p=0.75,list=FALSE)
+training <- training[inTrain,]
+cv <- training[-inTrain,]
+```
+
+### Data preprocessing
+
+Next, it may be useful to apply mean normalisation and feature scaling to the data so that the features are commensurate. Additionally, we'll also apply a Yeo-Johnson transform so that the features' distributions are more Gaussian-like. The Yeo-Johnson transform is similar to the Box-Cox transform discussed in class, but does not have the constraint that the predictor values must be strictly positive:
+```{r train_feature_scale}
+# The final column is the response; don't transform that:
+normalization <- preProcess(training[-ncol(training)],
+                            c("YeoJohnson","center","scale"))
+normalization
+```
+
+```{r predict_training_preprocess}
+training[-ncol(training)] <- predict(normalization, training[-ncol(training)])
+# summary(training)
+```
+
+## Training
+
+R can be a bit slow. Let's speed things up a bit by using all the available cores on our machine:
+
+```{r train.ctrl}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+ncores <- getDoParWorkers()
+```
+
+On this machine, we have `r ncores` available cores.
+
+```{r train_ctrl}
+k <- 10
+reps <- 3
+ctrl <- trainControl(method="cv", number=k, repeats=reps)
+# print(ctrl)
+```
+
+We'll train our model using repeated k-fold cross validation with `r k` folds and `r reps` repeats; that should help prevent overfitting. Out-of-bag (OOB) error estimates and error rates for each of the classes are printed during training.
+
+```{r prep.data}
+# The train S3 method is a little faster than the S4 method for large data:
+ydata = training$classe
+xdata = subset(training, select = -classe)
+```
+
+### Model
+
+```{r train, cache=TRUE}
+model <- train(y = ydata, x = xdata, method="LogitBoost", trControl=ctrl, do.trace=TRUE)
+
+print(model)
+plot(model)
+```
+
+**We used `r model$method` as classifier. The chief reason for this choice is my computer is old and slow, and even with tricks and speed-ups it would take until the end of time itself for my machine to train a more complex model. It is not possible for me to rent CPU time on a cloud or cluster; this is too expensive for me. Ensembling or model stacking is out of the question. A secondary consideration is the ability of the model to do multi-class classification. The set of classifiers to choose from that satisfy these criteria is quite small.** 
+
+### Performance evaluated on the training data
+
+We'll evaluate the accuracy of the model on the training set. This will underestimate the out of sample error, but will tell us if the model is likely to perform badly on new data: if the accuracy of the model estimated on the training set is low, we may want to consider other models.
+```{r predict_training}
+ypred <- predict(model, training)
+
+train.results <- confusionMatrix(ypred, ydata)
+print(train.results)
+```
+
+Next, we'll examine the importance of the variables used in building the model, and print the predictors that are used in the final model:
+```{r varImportance, fig.height=20}
+importance <- varImp(model, scale = FALSE)
+print(importance)
+plot(importance)
+predictors(model)
+```
+
+### Cross validation
+
+To evaluate the ability of the model to generalise to data not seen during training, we need to test the model on the hold-out cross validation data. But first, we need to preprocess the data using the same parameters that were learned on the training data:
+```{r predict_cv_preprocess}
+cv[-ncol(cv)] <- predict(normalization, cv[-ncol(cv)])
+# summary(training)
+```
+
+Now that the data has been transformed, we can predict the response variable and compare the results with the ground truth class labels. A contingency table, or "confusion matrix", allows us to examine the performance of the model and estimate the out of sample error:
+```{r predict_cv}
+ydata = cv$classe
+xdata = subset(cv, select = -classe)
+
+ypred <- predict(model, cv)
+
+cv.results <- confusionMatrix(ypred, ydata)
+print(cv.results)
+```
+
+The out of sample error is estimated to be $100\times(1-accuracy) =$ `r 100*(1-cv.results$overall[1])`%.
+
+## Testing
+
+Now that we're reasonably confident that the model will accurately predict the response variable, we shall predict on the test data. We'll process the data in an identical fashion to the training data:
+```{r tidy_test_data}
+# Remove the columns that we previously identified in the training data:
+print("Dropping these columns:")
+print(names(testing[na.data]))
+testing <- testing[!na.data]
+# Remove the first six columns that contain data not useful for prediction:
+testing <- testing[,7:ncol(testing)]
+# Remove columns with near zero variation identified in the training set:
+training <- training[, !nzv$nzv]
+```
+
+We preprocess the test data using the parameters that were learned on the training data:
+```{r predict_test_preprocess}
+testing[-ncol(testing)] <- predict(normalization, testing[-ncol(testing)])
+```
+
+The final column in the test data isn't useful, so we drop it. We then use the trained model to predict the test set response variable:
+```{r predict_test}
+testing = subset(testing, select = -problem_id)
+
+answers <- predict(model, testing)
+```
+
+### Wrap-up
+
+Finally, we'll create the text files to submit to Coursera. Each file corresponds to the prediction for the corresponding problem in the test data set.
+```{r create_files}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(answers)
+```
+
+It is good practice to shut down the workers by calling stopCluster:
+```{r stop_cluster}
+stopCluster(cl)
+```
